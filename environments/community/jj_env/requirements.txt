@@ -1,0 +1,11 @@
+# The jj execution server runs in Docker — no need to install jj locally.
+#
+# Start the server:
+#   docker build -t jj-exec-server environments/community/jj_env/
+#   docker run -p 5003:5003 jj-exec-server
+#
+# Python dependencies (client-side, in addition to atropos base):
+httpx>=0.24.0
+
+# Optional — needed only if using HuggingFace code file source:
+# datasets>=2.10.0
