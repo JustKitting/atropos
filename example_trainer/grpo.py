@@ -6,6 +6,7 @@ import random
 import shutil
 import string
 import subprocess
+import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -302,7 +303,7 @@ def train(config: TrainingConfig):
 
     # Init vllm
     vllm_command = [
-        "python",
+        sys.executable,
         "-m",
         "vllm.entrypoints.openai.api_server",
         "--model",
@@ -446,7 +447,7 @@ def train(config: TrainingConfig):
                     "train/grad_norm": grad_norm.item(),
                     "train/pos_logp": total_pos_logp,
                     "train/neg_logp": total_neg_logp,
-                    "train/logp": total_logp,
+                    "train/logp": total_logp.float().mean().item() if torch.is_tensor(total_logp) else total_logp,
                 },
                 step=step + 1,
             )
