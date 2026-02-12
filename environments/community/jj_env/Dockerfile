@@ -22,6 +22,7 @@ WORKDIR /app
 
 COPY server.py /app/server.py
 
-EXPOSE 5003
+ENV JJ_SERVER_PORT=5003
+EXPOSE ${JJ_SERVER_PORT}
 
 CMD ["python", "server.py"]

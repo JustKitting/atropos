@@ -47,8 +47,6 @@ from .task_generators import TaskGenerator, TaskSpec, count_lines_changed
 logger = logging.getLogger(__name__)
 
 # Generation limits
-MAX_REPLY_TOKENS = 4096
-MAX_GEN_PER_TURN = 1024
 MAX_ROLLOUT_TURNS = 15
 MAX_COMMANDS_PER_ROLLOUT = 15
 
@@ -145,14 +143,19 @@ class JJEnvConfig(BaseEnvConfig):
     """Configuration for the JJ VCS environment."""
 
     task_categories: List[str] = ["conflict_resolution", "squash", "rebase", "restore"]
-    difficulty_levels: List[str] = ["easy"]
+    difficulty_levels: List[str] = ["easy"]  # legacy, unused with depth curriculum
     jj_server_url: str = "http://localhost:5003"
     command_timeout_seconds: int = 30
     max_commands_per_rollout: int = MAX_COMMANDS_PER_ROLLOUT
     max_rollout_turns: int = MAX_ROLLOUT_TURNS
-    max_gen_per_turn: int = MAX_GEN_PER_TURN
+    max_gen_per_turn: int = 4096  # Max tokens per completion call
     use_curriculum: bool = True
-    curriculum_threshold: float = 0.3
+    curriculum_threshold: float = 0.75
+    curriculum_window: int = 20  # number of groups to average over
+    curriculum_min_depth: int = 1  # starting min mixups
+    curriculum_max_depth: int = 2  # starting max mixups
+    curriculum_depth_cap: int = 10  # never go above this
+    curriculum_overlap_pct: float = 0.5  # fraction of tasks from previous tier
     # File source: "hf" for HuggingFace real code, "synthetic" for templates
     file_source: str = "hf"
     hf_dataset_name: str = "bigcode/starcoderdata"
@@ -193,27 +196,30 @@ class JJEnv(BaseEnv):
         self.iter = 0
         self.rng = random.Random()
         self.curriculum_scores: List[float] = []
-        self.max_token_len = 16384
+        self.curriculum_min_depth: int = config.curriculum_min_depth
+        self.curriculum_max_depth: int = config.curriculum_max_depth
+        self.max_token_len = 32768
 
     @classmethod
     def config_init(cls):
         cfg = JJEnvConfig(
-            tokenizer_name="NousResearch/DeepHermes-3-Llama-3-8B-Preview",
+            tokenizer_name="NousResearch/Hermes-3-Llama-3.1-8B",
             group_size=8,
             use_wandb=True,
             rollout_server_url="http://localhost:8000",
             total_steps=2000,
             batch_size=256,
             steps_per_eval=50,
-            max_token_length=16384,
+            max_token_length=32768,
             inference_weight=1.0,
-            wandb_name="jj_vcs",
+            wandb_name="jj_vcs_hermes8b",
             eval_handling=EvalHandlingEnum.LIMIT_TRAIN,
             eval_limit_ratio=0.1,
+            file_source="synthetic",
         )
         servers = [
             APIServerConfig(
-                model_name="NousResearch/DeepHermes-3-Llama-3-8B-Preview",
+                model_name="NousResearch/Hermes-3-Llama-3.1-8B",
                 base_url="http://localhost:9004/v1",
                 api_key="x",
                 num_max_requests_at_once=32,
@@ -257,12 +263,15 @@ class JJEnv(BaseEnv):
             categories=self.config.task_categories,
             difficulties=self.config.difficulty_levels,
             file_source=file_source,
+            min_depth=self.curriculum_min_depth,
+            max_depth=self.curriculum_max_depth,
         )
 
         logger.info(
-            "JJEnv setup: categories=%s, difficulties=%s, file_source=%s",
+            "JJEnv setup: categories=%s, depth=%d-%d, file_source=%s",
             self.config.task_categories,
-            self.config.difficulty_levels,
+            self.curriculum_min_depth,
+            self.curriculum_max_depth,
             type(file_source).__name__,
         )
 
@@ -287,6 +296,77 @@ class JJEnv(BaseEnv):
             "tags": task_spec.tags,
         }
 
+    def _apply_action_mask(
+        self, raw: str, tokens: List[int], masks: List[int]
+    ) -> List[int]:
+        """
+        Mask reasoning text inside <think> — only train on actions + format.
+
+        Keeps gradient on:
+          - <tool_call>...</tool_call> (the actual commands)
+          - </think> and <done/> (format tokens)
+        Masks (sets to -100):
+          - All other text inside <think> (free-form reasoning)
+
+        The prompt tokens are already masked by tokenize_for_trainer.
+        """
+        import re
+
+        # Find character spans in raw text that should be UNMASKED
+        # (tool calls, closing format tokens)
+        unmasked_spans = []  # list of (start_char, end_char)
+
+        # Tool call blocks: <tool_call>...</tool_call>
+        for m in re.finditer(r"<tool_call>.*?</tool_call>", raw, re.DOTALL):
+            unmasked_spans.append((m.start(), m.end()))
+
+        # Tool response blocks (env-injected, should be masked — model didn't generate these)
+        # We DON'T unmask <tool_response> — those are env-injected, not model output
+
+        # Closing format tokens
+        for m in re.finditer(r"</think>", raw):
+            unmasked_spans.append((m.start(), m.end()))
+        for m in re.finditer(r"<done/>", raw):
+            unmasked_spans.append((m.start(), m.end()))
+
+        if not unmasked_spans:
+            return masks  # Nothing to unmask, keep original
+
+        # Map character offsets to token offsets
+        # Decode token-by-token to build char→token mapping
+        # First find where the assistant content starts in the full token sequence
+        # (prompt tokens are already -100 in masks)
+        assistant_start_tok = 0
+        for i, m in enumerate(masks):
+            if m != -100:
+                assistant_start_tok = i
+                break
+
+        # Build character offset map for the assistant tokens
+        char_to_tok = {}
+        current_char = 0
+        for tok_idx in range(assistant_start_tok, len(tokens)):
+            tok_text = self.tokenizer.decode([tokens[tok_idx]])
+            for c in range(len(tok_text)):
+                if current_char + c < len(raw):
+                    char_to_tok[current_char + c] = tok_idx
+            current_char += len(tok_text)
+
+        # Build set of token indices that should stay unmasked
+        unmasked_toks = set()
+        for span_start, span_end in unmasked_spans:
+            for char_pos in range(span_start, span_end):
+                if char_pos in char_to_tok:
+                    unmasked_toks.add(char_to_tok[char_pos])
+
+        # Apply: mask everything in assistant range except unmasked tokens
+        new_masks = list(masks)
+        for i in range(assistant_start_tok, len(new_masks)):
+            if i not in unmasked_toks:
+                new_masks[i] = -100
+
+        return new_masks
+
     @staticmethod
     def _extract_tool_call(text: str) -> Optional[Dict]:
         """
@@ -302,7 +382,10 @@ class JJEnv(BaseEnv):
         json_text = json_text.replace("</tool_call>", "").strip()
 
         try:
-            return json.loads(json_text)
+            parsed = json.loads(json_text)
+            if isinstance(parsed, dict):
+                return parsed
+            return None
         except json.JSONDecodeError:
             # Try brace-counting extraction
             brace_count = 0
@@ -317,7 +400,9 @@ class JJEnv(BaseEnv):
                         break
             if json_end > 0:
                 try:
-                    return json.loads(json_text[:json_end])
+                    parsed = json.loads(json_text[:json_end])
+                    if isinstance(parsed, dict):
+                        return parsed
                 except json.JSONDecodeError:
                     pass
         return None
@@ -469,8 +554,8 @@ class JJEnv(BaseEnv):
             if prompt_msgs_list[i] is None:
                 prompt_msgs_list[i] = first_good_msgs
 
-        # Initialize per-rollout state
-        assistant_contents = [""] * num_rollouts
+        # Initialize per-rollout state — pre-fill with <think> to force format
+        assistant_contents = ["<think>\n"] * num_rollouts
         done = [repo_ids[i] is None for i in range(num_rollouts)]
         commands_used: List[List[str]] = [[] for _ in range(num_rollouts)]
         write_tracking: List[Dict] = [
@@ -501,6 +586,10 @@ class JJEnv(BaseEnv):
             if not active_prompts:
                 break
 
+            # Stop tokens: </tool_call> for normal tool use,
+            # <tool_response> to catch hallucinated responses
+            stop_tokens = ["</tool_call>", "<tool_response>"]
+
             # Get completions
             if turn_idx == 0 and len(set(active_prompts)) == 1:
                 # First turn: all prompts identical → batch with n
@@ -509,7 +598,7 @@ class JJEnv(BaseEnv):
                     n=len(active_prompts),
                     max_tokens=self.config.max_gen_per_turn,
                     temperature=0.8,
-                    stop="</tool_call>",
+                    stop=stop_tokens,
                 )
                 replies = [c.text for c in resp.choices]
             else:
@@ -521,7 +610,7 @@ class JJEnv(BaseEnv):
                             n=1,
                             max_tokens=self.config.max_gen_per_turn,
                             temperature=0.8,
-                            stop="</tool_call>",
+                            stop=stop_tokens,
                         )
                         return comp.choices[0].text
                     except Exception as e:
@@ -537,6 +626,12 @@ class JJEnv(BaseEnv):
                     continue
 
                 reply = replies[prompt_idx] or ""
+
+                # If model returned empty/whitespace, it hit EOS — mark done
+                if not reply.strip():
+                    done[rollout_idx] = True
+                    continue
+
                 assistant_contents[rollout_idx] += reply
                 raw = assistant_contents[rollout_idx]
 
@@ -545,7 +640,8 @@ class JJEnv(BaseEnv):
                     done[rollout_idx] = True
                     continue
 
-                # Check for tool call
+                # Check for tool call (stop fired on </tool_call> or <tool_response>)
+                # Both cases mean there's a <tool_call> without a <tool_response> after it
                 if self._has_unresponded_tool_call(raw):
                     call_json = self._extract_tool_call(raw)
                     if call_json is None:
@@ -596,6 +692,20 @@ class JJEnv(BaseEnv):
                         logger.error(
                             f"Tool exec failed for rollout {rollout_idx}: {e}"
                         )
+                        # Return error as tool response so model gets feedback
+                        error_msg = (
+                            f"Error: Invalid tool call format. "
+                            f"Expected: {{\"name\":\"jj\",\"arguments\":{{\"command\":\"...\"}}}}"
+                        )
+                        content = assistant_contents[rollout_idx]
+                        content = re.sub(
+                            r"</tool_call.*?$", "", content, flags=re.MULTILINE
+                        )
+                        assistant_contents[rollout_idx] = content
+                        assistant_contents[rollout_idx] += "</tool_call>\n"
+                        assistant_contents[rollout_idx] += (
+                            f'<tool_response>{{"error": "{error_msg}"}}</tool_response>\n'
+                        )
                         done[rollout_idx] = True
                         continue
                 else:
@@ -634,11 +744,31 @@ class JJEnv(BaseEnv):
                     write_file_attempted=write_tracking[rollout_idx]["attempted"],
                 )
 
-                # Format penalty: must have </think> or <done/>
-                if "</think>" not in raw and "<done/>" not in raw:
-                    reward = max(breakdown.total - 0.2, -1.0)
+                # Detect hallucinated tool responses
+                num_executed = len(commands_used[rollout_idx])
+                num_responses = raw.count("<tool_response>")
+                num_hallucinated = max(0, num_responses - num_executed)
+
+                # Format enforcement: graduated penalty
+                has_think_close = "</think>" in raw
+                has_done = "<done/>" in raw
+
+                # <think> is pre-filled, only reward model for closing properly
+                format_bonus = 0.0
+                if has_think_close:
+                    format_bonus += 0.1
+                if has_done:
+                    format_bonus += 0.1
+
+                # Hallucination penalty: -0.2 per fake tool response
+                hallucination_penalty = num_hallucinated * -0.2
+
+                if has_think_close and has_done:
+                    # Proper format: full task score + format bonus
+                    reward = breakdown.total + format_bonus + hallucination_penalty
                 else:
-                    reward = breakdown.total
+                    # Didn't close properly: scaled-down task score + partial bonus
+                    reward = breakdown.total * 0.5 + format_bonus + hallucination_penalty
 
                 logger.info(
                     f"[Rollout {rollout_idx}] {task_spec.task_id} "
@@ -652,13 +782,15 @@ class JJEnv(BaseEnv):
                 ]
 
                 toks = self.tokenizer.encode(raw)
-                if len(toks) > MAX_REPLY_TOKENS:
-                    toks = toks[:MAX_REPLY_TOKENS]
+                if len(toks) > self.max_token_len:
+                    toks = toks[:self.max_token_len]
                     raw = self.tokenizer.decode(toks)
                     final_assistant_msg = {"role": "assistant", "content": raw}
                     full_ctx = prompt_msgs_list[rollout_idx] + [final_assistant_msg]
 
                 tok = tokenize_for_trainer(self.tokenizer, full_ctx)
+                # Mask reasoning text: only train on tool calls + format tokens
+                tok["masks"] = self._apply_action_mask(raw, tok["tokens"], tok["masks"])
                 scored["tokens"].append(tok["tokens"])
                 scored["masks"].append(tok["masks"])
                 scored["scores"].append(reward)
@@ -676,29 +808,31 @@ class JJEnv(BaseEnv):
             if repo_id is not None:
                 await self.executor.cleanup_repo(repo_id)
 
-        # ── Curriculum advancement ───────────────────────────────────────
+        # ── Curriculum advancement (depth-based) ─────────────────────────
         if self.config.use_curriculum and scored["scores"]:
             avg_score = sum(scored["scores"]) / len(scored["scores"])
             self.curriculum_scores.append(avg_score)
-            if len(self.curriculum_scores) >= 20:
-                recent_avg = sum(self.curriculum_scores[-20:]) / 20
-                if recent_avg > self.config.curriculum_threshold:
-                    all_diffs = ["easy", "medium", "hard"]
-                    max_idx = max(
-                        all_diffs.index(d) for d in self.config.difficulty_levels
-                    )
-                    if max_idx < len(all_diffs) - 1:
-                        next_diff = all_diffs[max_idx + 1]
-                        if next_diff not in self.config.difficulty_levels:
-                            self.config.difficulty_levels.append(next_diff)
-                            self.task_generator.difficulties = (
-                                self.config.difficulty_levels
-                            )
-                            logger.info(
-                                f"Curriculum: advancing to include '{next_diff}' "
-                                f"(recent avg: {recent_avg:.3f})"
-                            )
-                            self.curriculum_scores.clear()
+            window = self.config.curriculum_window
+            if len(self.curriculum_scores) >= window:
+                recent_avg = sum(self.curriculum_scores[-window:]) / window
+                if recent_avg >= self.config.curriculum_threshold:
+                    cap = self.config.curriculum_depth_cap
+                    if self.curriculum_max_depth < cap:
+                        old_min, old_max = self.curriculum_min_depth, self.curriculum_max_depth
+                        # Advance: min+1, max+2 — floor rises but overlap remains
+                        # 1-2 → 2-4 → 3-6 → 4-8 → 5-10
+                        new_min = self.curriculum_min_depth + 1
+                        new_max = min(self.curriculum_max_depth + 2, cap)
+                        self.curriculum_min_depth = new_min
+                        self.curriculum_max_depth = new_max
+                        self.task_generator.min_depth = new_min
+                        self.task_generator.max_depth = new_max
+                        logger.info(
+                            f"Curriculum: depth {old_min}-{old_max} → "
+                            f"{new_min}-{new_max} "
+                            f"(recent avg: {recent_avg:.3f})"
+                        )
+                        self.curriculum_scores.clear()
 
         # Check if all scores are the same (bad for training signal)
         if scored["scores"] and all(
@@ -719,10 +853,10 @@ class JJEnv(BaseEnv):
         total, correct = 0, 0
 
         for cat in self.config.task_categories[:2]:
-            for diff in self.config.difficulty_levels[:1]:
+            for eval_depth in [1, self.curriculum_max_depth]:
                 seed = self.rng.randint(0, 2**31)
                 task_spec = self.task_generator.generate_task(
-                    seed=seed, category=cat, difficulty=diff
+                    seed=seed, category=cat, depth=eval_depth,
                 )
 
                 repo_id = None
@@ -784,8 +918,8 @@ class JJEnv(BaseEnv):
         for k, v in self.eval_metrics:
             metrics[k] = v
         self.eval_metrics = []
-        metrics["train/num_difficulties"] = len(self.config.difficulty_levels)
-        metrics["train/difficulties"] = ",".join(self.config.difficulty_levels)
+        metrics["train/curriculum_min_depth"] = self.curriculum_min_depth
+        metrics["train/curriculum_max_depth"] = self.curriculum_max_depth
         await super().wandb_log(metrics)
 
 

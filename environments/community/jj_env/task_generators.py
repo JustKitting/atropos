@@ -920,21 +920,25 @@ class PipelineSampler:
     def sample(
         self,
         seed: int,
-        difficulty: str,
+        difficulty: str = "depth_1",
         category_hints: Optional[List[str]] = None,
+        depth: Optional[int] = None,
     ) -> Tuple[ScramblePipeline, Dict[str, str]]:
         """
         Sample a pipeline and base files.
         Returns (pipeline, base_files).
 
+        If depth is provided directly, use it. Otherwise fall back to
+        legacy difficulty string mapping.
         category_hints biases op selection but doesn't filter exclusively.
         """
         rng = Random(seed)
 
-        depth_map = {"easy": 1, "medium": rng.randint(2, 3), "hard": rng.randint(3, 5), "expert": rng.randint(6, 10)}
-        depth = depth_map.get(difficulty, 1)
+        if depth is None:
+            depth_map = {"easy": 1, "medium": rng.randint(2, 3), "hard": rng.randint(3, 5), "expert": rng.randint(6, 10)}
+            depth = depth_map.get(difficulty, 1)
 
-        # Sample base files from the file source — expert gets more files for complex scenarios
+        # Sample base files from the file source — more files for complex scenarios
         n_files = 3 if depth >= 6 else (2 if (depth >= 2 and rng.random() < 0.5) else 1)
         base_files = self.file_source.sample(seed, n_files)
 
@@ -1002,28 +1006,40 @@ class TaskGenerator:
         categories: Optional[List[str]] = None,
         difficulties: Optional[List[str]] = None,
         file_source: Optional[FileSource] = None,
+        # Depth-based curriculum params
+        min_depth: int = 1,
+        max_depth: int = 2,
     ):
         self.categories = categories or ["conflict_resolution", "squash", "rebase", "restore"]
         self.difficulties = difficulties or ["easy"]
         self.sampler = PipelineSampler(file_source=file_source)
         self._counter = 0
+        self.min_depth = min_depth
+        self.max_depth = max_depth
 
     def generate_task(
         self,
         seed: Optional[int] = None,
         category: Optional[str] = None,
         difficulty: Optional[str] = None,
+        depth: Optional[int] = None,
     ) -> TaskSpec:
         """
         Generate a task spec.
 
-        If category/difficulty not specified, picks randomly from configured options.
+        If depth is provided, uses it directly (new curriculum system).
+        Otherwise falls back to legacy difficulty string.
         """
         rng = random.Random(seed if seed is not None else self._counter)
         self._counter += 1
 
+        # New depth-based system: sample a depth from the current range
+        if depth is None:
+            depth = rng.randint(self.min_depth, self.max_depth)
+
+        # Difficulty label for logging/tracking
         if difficulty is None:
-            difficulty = rng.choice(self.difficulties)
+            difficulty = f"depth_{depth}"
 
         # Category becomes a hint for the sampler
         hints = None
@@ -1035,6 +1051,7 @@ class TaskGenerator:
         task_seed = seed if seed is not None else rng.randint(0, 2**31)
         pipeline, base_files = self.sampler.sample(
             seed=task_seed, difficulty=difficulty, category_hints=hints,
+            depth=depth,
         )
         return pipeline.execute(base_files, task_seed, difficulty)
 

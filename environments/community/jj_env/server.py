@@ -329,4 +329,9 @@ def repo_cleanup(repo_id: str):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5003)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=int(os.environ.get("JJ_SERVER_PORT", 5003)))
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
+    app.run(host=args.host, port=args.port)
